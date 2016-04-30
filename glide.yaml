@@ -1,0 +1,4 @@
+package: github.com/lonre/backroom
+import:
+- package: gopkg.in/redis.v3
+- package: github.com/Sirupsen/logrus

@@ -1,0 +1,18 @@
+hash: 860166894b3ffa9549431cb0c97f6903acb44c064e7f4c87efd6e0ba9146f332
+updated: 2016-05-25T11:07:48.626684449+08:00
+imports:
+- name: github.com/Sirupsen/logrus
+  version: 6d9ae300aaf85d6acd2e5424081c7fcddb21dab8
+- name: golang.org/x/sys
+  version: d4feaf1a7e61e1d9e79e6c4e76c6349e9cab0a03
+  subpackages:
+  - unix
+- name: gopkg.in/bsm/ratelimit.v1
+  version: db14e161995a5177acef654cb0dd785e8ee8bc22
+- name: gopkg.in/redis.v3
+  version: b3514029955f38f2a1120b5c3ad59f241d9eecca
+  subpackages:
+  - internal/consistenthash
+  - internal/hashtag
+  - internal/pool
+devImports: []
