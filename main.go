@@ -27,6 +27,30 @@ var (
 	fDebug = flag.Bool("debug", false, "Enable debug mode")
 )
 
+var directHTTPTransport = &http.Transport{
+	Proxy:             nil,
+	DisableKeepAlives: true,
+	Dial: (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).Dial,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+}
+
+var proxyHTTPTransport = &http.Transport{
+	Proxy: func(*http.Request) (*url.URL, error) {
+		return strat.ProxyURL()
+	},
+	DisableKeepAlives: true,
+	Dial: (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).Dial,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+}
+
 // UpstreamProxyStrategy interface
 type UpstreamProxyStrategy interface {
 	ProxyURL() (*url.URL, error)
@@ -88,7 +112,7 @@ func main() {
 	proxyServer := &http.Server{
 		Addr:           listenAddress,
 		Handler:        http.HandlerFunc(proxyHandler),
-		ReadTimeout:    30 * time.Second,
+		ReadTimeout:    120 * time.Second,
 		WriteTimeout:   120 * time.Second,
 		MaxHeaderBytes: 1 << 20,
 	}
@@ -109,40 +133,78 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case "CONNECT":
-		hj, _ := w.(http.Hijacker)
-		clientConn, _, err := hj.Hijack()
-		if err != nil {
-			log.Warnf("proxy connection hijack failed: %s", err.Error())
-			return
-		}
-
-		var proxyConn net.Conn
-		for try := 0; try <= strat.RetryLimit(); try++ {
-			if try == strat.RetryLimit() && strat.RetryFallback() {
-				proxyConn, err = proxyConnection(&strategy.None{}, r)
-			} else {
-				proxyConn, err = proxyConnection(strat, r)
-			}
-			if err != nil {
-				log.Warnf("upstream proxy connection retry: %d error: %s", try, err.Error())
-				if try == strat.RetryLimit() {
-					fmt.Fprint(clientConn, "HTTP/1.1 502 Not implemented\r\n\r\n")
-					log.Debugf("close response client connection %s", clientConn.RemoteAddr())
-					clientConn.Close()
-					return
-				}
-				continue
-			}
-			break
-		}
-
-		fmt.Fprint(clientConn, "HTTP/1.1 200 Connection established\r\n\r\n")
-
-		go copyAndClose(proxyConn, clientConn)
-		go copyAndClose(clientConn, proxyConn)
+		httpsProxy(w, r)
 	default:
-		log.Println(r.Method)
+		httpProxy(w, r)
 	}
+}
+
+func httpProxy(w http.ResponseWriter, r *http.Request) {
+	var resp *http.Response
+	var err error
+
+	removeHopByHopHeaders(r)
+
+	for try := 0; try <= strat.RetryLimit(); try++ {
+		if try == strat.RetryLimit() && strat.RetryFallback() {
+			resp, err = directHTTPTransport.RoundTrip(r)
+		} else {
+			resp, err = proxyHTTPTransport.RoundTrip(r)
+		}
+		if err != nil {
+			log.Warnf("upstream request retry: %d error: %s", try, err.Error())
+			if try == strat.RetryLimit() {
+				w.WriteHeader(502)
+				return
+			}
+			continue
+		}
+		break
+	}
+	defer resp.Body.Close()
+
+	copyHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	written, err := io.Copy(w, resp.Body)
+	if err != nil {
+		log.Warnf("http proxy copy response err: %s", err.Error())
+	} else {
+		log.Debugf("copyed %d bytes from %s to %s", written, r.URL.Host, r.RemoteAddr)
+	}
+}
+
+func httpsProxy(w http.ResponseWriter, r *http.Request) {
+	hj, _ := w.(http.Hijacker)
+	clientConn, _, err := hj.Hijack()
+	if err != nil {
+		log.Warnf("proxy connection hijack failed: %s", err.Error())
+		return
+	}
+
+	var proxyConn net.Conn
+	for try := 0; try <= strat.RetryLimit(); try++ {
+		if try == strat.RetryLimit() && strat.RetryFallback() {
+			proxyConn, err = proxyConnection(&strategy.None{}, r)
+		} else {
+			proxyConn, err = proxyConnection(strat, r)
+		}
+		if err != nil {
+			log.Warnf("upstream proxy connection retry: %d error: %s", try, err.Error())
+			if try == strat.RetryLimit() {
+				fmt.Fprint(clientConn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
+				log.Debugf("close response client connection %s", clientConn.RemoteAddr())
+				clientConn.Close()
+				return
+			}
+			continue
+		}
+		break
+	}
+
+	fmt.Fprint(clientConn, "HTTP/1.1 200 Connection established\r\n\r\n")
+
+	go copyAndClose(proxyConn, clientConn)
+	go copyAndClose(clientConn, proxyConn)
 }
 
 func proxyConnection(ups UpstreamProxyStrategy, r *http.Request) (net.Conn, error) {
@@ -190,4 +252,28 @@ func copyAndClose(dst, src net.Conn) {
 		return
 	}
 	log.Debugf("copyed %d bytes from %s to %s", written, src.RemoteAddr(), dst.RemoteAddr())
+}
+
+func removeHopByHopHeaders(r *http.Request) {
+	r.RequestURI = ""
+	// remove Hop-by-hop headers  https://www.ietf.org/rfc/rfc2616.txt
+	r.Header.Del("Connection")
+	r.Header.Del("Keep-Alive")
+	r.Header.Del("Proxy-Authenticate")
+	r.Header.Del("Proxy-Authorization")
+	r.Header.Del("TE")
+	r.Header.Del("Trailers")
+	r.Header.Del("Transfer-Encoding")
+	r.Header.Del("Upgrade")
+}
+
+func copyHeaders(dst, src http.Header) {
+	for k := range dst {
+		dst.Del(k)
+	}
+	for k, vs := range src {
+		for _, v := range vs {
+			dst.Add(k, v)
+		}
+	}
 }
